@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Training outputs
+experiments/
+runs/
+logs/
+*.pth
+*.pt
+
+# Pretrained weights (downloaded automatically on first run)
+pretrained_models/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

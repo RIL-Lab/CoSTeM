@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch a single EmbryoNet (EQENet) training run.
+# Launch a single CoSTeM training run.
 #
 # Usage:
 #   ROOT_PATH=/path/to/embryo_videos bash train.sh
@@ -22,13 +22,13 @@ TASK="${TASK:-Grading}"                        # Grading (3 classes) or Evaluati
 NUM_CLASSES="${NUM_CLASSES:-3}"
 MASTER_PORT="${MASTER_PORT:-29571}"
 NPROC="${NPROC:-1}"                            # number of GPUs / processes per node
-EXTRA_ARGS="${EXTRA_ARGS:-}"                   # extra flags forwarded to train_new_version.py
+EXTRA_ARGS="${EXTRA_ARGS:-}"                   # extra flags forwarded to train.py
 
 mkdir -p "$OUTPUT_DIR"
 
 echo "[train.sh] exp_name=$EXP_NAME seed=$SEED root_path=$ROOT_PATH output_dir=$OUTPUT_DIR"
 
-torchrun --nproc-per-node "$NPROC" --master_port "$MASTER_PORT" train_new_version.py \
+torchrun --nproc-per-node "$NPROC" --master_port "$MASTER_PORT" train.py \
     --exp_name "$EXP_NAME" \
     --seed "$SEED" \
     --task "$TASK" \

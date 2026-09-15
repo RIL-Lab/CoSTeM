@@ -74,8 +74,8 @@ class GatherMeter:
         self.labels = [t.cpu() for t in torch.cat(labels, dim=0)]
 
 
-class ClsReortor:
-    "calculate the metrics used for classification task"
+class ClassificationReporter:
+    """Compute the metrics used for the classification task."""
     def __init__(self, preds, labels) -> None:
         self.preds = preds
         self.labels = labels
@@ -99,16 +99,17 @@ class ClsReortor:
         return report
 
 
-def epoch_saving(config, epoch, model,  max_f1, optimizer, lr_scheduler, logger, working_dir, is_best):
+def save_checkpoint(config, epoch, model, max_f1, optimizer, lr_scheduler, logger, working_dir, is_best):
+    """Save a checkpoint; only the best model (highest validation macro-F1) is kept."""
     save_state = {'model': model.state_dict(),
                   'optimizer': optimizer.state_dict(),
                   'lr_scheduler': lr_scheduler.state_dict(),
                   'max_f1': max_f1,
                   'epoch': epoch,
                   'config': config}
-    
+
     if is_best:
-        best_path = os.path.join(working_dir, f'best.pth')
+        best_path = os.path.join(working_dir, 'best.pth')
         torch.save(save_state, best_path)
         logger.info(f"{best_path} saved !!!")
 

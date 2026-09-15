@@ -1,3 +1,9 @@
+"""CoSTeM: Complementary Spatial-Temporal pattern Mining for embryo grading.
+
+Reference: Y. Sun et al., "Time-Lapse Video-Based Embryo Grading via Complementary
+Spatial-Temporal Pattern Mining", MICCAI 2025 (arXiv:2506.04950).
+"""
+
 import os
 import sys
 import time
@@ -14,15 +20,15 @@ from transformers import CLIPModel
 
 # make the repository root importable no matter where the module is imported from
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from embryo.utils.tools import AverageMeter, GatherMeter, ClsReortor
-from embryo.data.embryo_dataset import MyEmbryoDataset, mmcv_collate, SubsetRandomSampler
-from embryo.models.modules import MultiframeIntegrationTransformer, AdaFeatSelection, MSFeatureModulation, FeatureSelectionModule
+from embryo.utils.tools import AverageMeter, GatherMeter, ClassificationReporter
+from embryo.data.embryo_dataset import EmbryoDataset, mmcv_collate, SubsetRandomSampler
+from embryo.models.modules import BypassAdaptationNetwork, MixtureOfCrossAttentiveExperts, TemporalSelectionBlock, TemporalTransformer
 from embryo.models.base_model import BaseModel
-from embryo.models.custom_clip import build_backbone
+from embryo.models.clip_image_encoder import build_image_encoder
 
 
-def build_clip_vision_state_dict(ckpt_path):
-    """Build the state dict used to initialize the frozen CLIP ViT-B/16 backbone.
+def build_image_encoder_state_dict(ckpt_path):
+    """Build the state dict used to initialize the frozen CLIP ViT-B/16 image encoder.
 
     The expected checkpoint is a dict containing a ``state_dict`` key whose keys are
     prefixed with ``vision_model.``. When the file does not exist, the weights of
@@ -47,43 +53,53 @@ def build_clip_vision_state_dict(ckpt_path):
     return new_state_dict
 
 
-class EQENet(BaseModel):
-    """Embryo Quality Evaluation Network.
+class CoSTeM(BaseModel):
+    """Complementary Spatial-Temporal pattern Mining network for embryo grading.
 
-    A frozen CLIP ViT-B/16 encodes every sampled frame, multi-scale hidden states are
-    modulated and then spatially / temporally selected, and a Multiframe Integration
-    Transformer aggregates the frame-level cls tokens before the final classifier.
+    Frames are encoded by a frozen CLIP ViT-B/16 image encoder, whose intermediate
+    features are modulated by a Bypass Adaptation Network. The resulting tokens are split
+    into two complementary streams:
+
+    * **Morphological branch** (patch tokens): Mixture of Cross-Attentive Experts (MCAE)
+      followed by a Temporal Selection Block (TSB) mines the static *spatial* pattern;
+    * **Morphokinetic branch** (class tokens): a Temporal Transformer mines the dynamic
+      *temporal* pattern.
+
+    The two patterns are concatenated and fed to an MLP classifier.
     """
 
     def __init__(self, config) -> None:
         super().__init__(config)
 
-        self.adaptive_query_init(config)
+        self.build_branches(config)
 
-    def adaptive_query_init(self, config):
+    def build_branches(self, config):
         self.config = config
         num_classes = config.num_classes
 
-        # frame encoder: frozen CLIP ViT-B/16, multi-scale hidden states [3, 6, 9, 12]
-        self.backbone = build_backbone(config)
-        self.loaded_keys, self.missing_keys = self.load_pretrained_backbone()
+        # frozen pretrained image encoder, intermediate features are read from these layers
+        self.adaptation_layers = [3, 6, 9, 12]
+        self.image_encoder = build_image_encoder(config)
+        self.loaded_keys, self.missing_keys = self.load_pretrained_encoder()
 
-        self.ms_feat_idx = [3, 6, 9, 12]
         length = config.frame_seq_len
 
-        self.ms_feat_aggregator = MSFeatureModulation(n_scale=len(self.ms_feat_idx), embed_dim=768, hidden_dim=192, reduction=4)
-        self.temporal_selector = AdaFeatSelection(seq_len=length, dropout=0.3, pe=True, n_queries=8, embed_dim=768, n_layers=2, mlp_ratio=1.5)
-        self.spatial_selection = FeatureSelectionModule(seq_len=length, input_dim=768, num_experts=8, num_heads=8, dropout=0.3)
+        # bypass adaptation: one MLP adaptor + channel reduction per selected layer
+        self.bypass_adaptation = BypassAdaptationNetwork(n_scale=len(self.adaptation_layers), embed_dim=768, hidden_dim=192, reduction=4)
 
-        # temporal modelling runs on every second frame, hence length // 2
-        self.mit = MultiframeIntegrationTransformer(length=length // 2, embed_dim=768 // 2, layers=4, mlp_ratio=1.5, dropout=0.5, pe=True)
+        # morphological branch: spatial pattern mining
+        self.mcae = MixtureOfCrossAttentiveExperts(seq_len=length, input_dim=768, num_experts=8, num_heads=8, dropout=0.3)
+        self.tsb = TemporalSelectionBlock(seq_len=length, dropout=0.3, pe=True, n_experts=8, embed_dim=768, n_layers=2, mlp_ratio=1.5)
+
+        # morphokinetic branch: temporal pattern mining on every second frame
+        self.temporal_transformer = TemporalTransformer(length=length // 2, embed_dim=768 // 2, layers=4, mlp_ratio=1.5, dropout=0.5, pe=True)
         self.ch_reduce = nn.Linear(768, 384, bias=False)
 
         self.classifier = nn.Sequential(
                                 nn.Linear(768 + 384, 256),
                                 nn.GELU(),
                                 nn.Linear(256, num_classes)
-                                        ) 
+                                        )
 
     def forward(self, batch: torch.Tensor):
         imgs = batch["imgs"]
@@ -91,57 +107,58 @@ class EQENet(BaseModel):
         b, t, c, h, w = imgs.shape
         imgs = imgs.view(b * t, c, h, w)
 
-        output_dict = self.backbone(pixel_values=imgs, output_hidden_states=True) # bt c
+        output_dict = self.image_encoder(pixel_values=imgs, output_hidden_states=True)
 
-        scale_idx = self.ms_feat_idx
         hidden_states = output_dict["hidden_states"]
-        selected_feats = [hidden_states[idx] for idx in scale_idx]
+        selected_feats = [hidden_states[idx] for idx in self.adaptation_layers]
 
-        ms_feats, ms_cls = self.ms_feat_aggregator(selected_feats)
-        embed_dim = ms_feats.size(-1)
+        # patch tokens -> morphological branch, class tokens -> morphokinetic branch
+        patch_tokens, cls_tokens = self.bypass_adaptation(selected_feats)
+        embed_dim = patch_tokens.size(-1)
 
-        ms_feats, spatial_attn = self.spatial_selection(ms_feats)
-        ms_feats = ms_feats.view(b, t, embed_dim)
+        # spatial pattern: per-frame expert selection + key frame selection
+        spatial_feats, spatial_attn = self.mcae(patch_tokens)
+        spatial_feats = spatial_feats.view(b, t, embed_dim)
+        spatial_pattern, temporal_attn = self.tsb(spatial_feats)
+        spatial_pattern = torch.mean(spatial_pattern, dim=1, keepdim=False)
 
-        spatial_out, temporal_attn = self.temporal_selector(ms_feats)
-        spatial_out = torch.mean(spatial_out, dim=1, keepdim=False)
+        # temporal pattern: global temporal modelling of the class token sequence
+        cls_tokens = cls_tokens.view(b, -1, embed_dim)
+        cls_tokens = self.ch_reduce(cls_tokens)[:, ::2, :]
+        temporal_pattern = self.temporal_transformer(cls_tokens)
+        temporal_pattern = torch.mean(temporal_pattern, dim=1, keepdim=False)
 
-        ms_cls = ms_cls.view(b, -1, embed_dim)
-        ms_cls = self.ch_reduce(ms_cls)[:, ::2, :]
-        temporal_out = self.mit(ms_cls) # b t c
-        temporal_out = torch.mean(temporal_out, dim=1, keepdim=False) # b c    
-
-        out = torch.cat([spatial_out, temporal_out], dim=-1)
-
+        out = torch.cat([spatial_pattern, temporal_pattern], dim=-1)
         logits = self.classifier(out)
-        
+
         return dict(
                     logits=logits,
-                    temporal_loss = self.temporal_selector.diversity_loss * 0.1,
+                    diversity_loss = self.tsb.diversity_loss,
                     spatial_attn=spatial_attn,
                     temporal_attn=temporal_attn
-                    )  
+                    )
 
-    def load_pretrained_backbone(self):
+    def load_pretrained_encoder(self):
         ckpt_path = getattr(self.config, "pretrained_ckpt", None)
-        new_state_dict = build_clip_vision_state_dict(ckpt_path)
+        new_state_dict = build_image_encoder_state_dict(ckpt_path)
 
-        self.backbone.load_state_dict(new_state_dict, strict=False)
+        self.image_encoder.load_state_dict(new_state_dict, strict=False)
 
         # collect the parameters that were not initialized from the pretrained weights
         loaded_keys = set(new_state_dict.keys())
-        model_keys = set(self.backbone.state_dict().keys())
+        model_keys = set(self.image_encoder.state_dict().keys())
         missing_keys = sorted(list(model_keys - loaded_keys))
 
         return loaded_keys, missing_keys
 
-    def set_trainable_params(self):
-        loaded_keys = ["backbone." + key for key in self.loaded_keys]
+    def freeze_image_encoder(self):
+        loaded_keys = ["image_encoder." + key for key in self.loaded_keys]
         for name, param in self.named_parameters():
             if name in loaded_keys:
                 param.requires_grad = False
 
     def build_dataloader(self, logger=None, world_size=1, global_rank=0):
+        # pixel mean / std of the embryo frames, measured on the training split
         img_norm_cfg = dict(mean=[122.52, 124.34, 121.65], std=[75.94, 76.18, 75.70], to_bgr=False)
 
         train_pipeline = [
@@ -165,11 +182,9 @@ class EQENet(BaseModel):
             dict(type='Collect', keys=['imgs', 'quality', "time_slots", "grading", "mask"], meta_keys=[]),
             dict(type='ToTensor', keys=['imgs', 'quality', "time_slots", "grading", "mask"]),
         ]
-            
-        
-        train_data = MyEmbryoDataset(root_path=self.config.root_path, ann_file=self.config.train_file, 
-                                     pipeline=train_pipeline, sample_ratio=1.0)
 
+        train_data = EmbryoDataset(root_path=self.config.root_path, ann_file=self.config.train_file,
+                                   pipeline=train_pipeline, sample_ratio=1.0)
 
         sampler_train = torch.utils.data.DistributedSampler(
                 train_data, num_replicas=world_size, rank=global_rank, shuffle=True
@@ -184,7 +199,7 @@ class EQENet(BaseModel):
             drop_last=True,
             collate_fn=collate_fn
         )
-        
+
         val_pipeline = [
             dict(type='DecordInit'),
             dict(type='SampleFrames', 
@@ -203,9 +218,9 @@ class EQENet(BaseModel):
             dict(type='Collect', keys=['imgs', 'quality', "embryo_ID", "effective_duration", "year", "female_age", "time_slots", "grading", "mask"], meta_keys=[]),
             dict(type='ToTensor', keys=['imgs', 'quality', "embryo_ID", "effective_duration", "year", "female_age", "time_slots", "grading", "mask"])
         ]
-        
-        val_data = MyEmbryoDataset(root_path=self.config.root_path, ann_file=self.config.val_file,
-                                   pipeline=val_pipeline)
+
+        val_data = EmbryoDataset(root_path=self.config.root_path, ann_file=self.config.val_file,
+                                 pipeline=val_pipeline)
         indices = np.arange(global_rank, len(val_data), world_size)
         sampler_val = SubsetRandomSampler(indices)
         val_loader = DataLoader(
@@ -218,14 +233,14 @@ class EQENet(BaseModel):
         )
 
         return train_data, val_data, train_loader, val_loader
-    
+
     def build_optimizer(self, logger=None):
-        self.set_trainable_params()
+        self.freeze_image_encoder()
 
         optimizer = optim.AdamW(self.parameters(), lr=self.config.lr, betas=(0.9, 0.98), eps=1e-8, weight_decay=self.config.weight_decay)
-    
+
         return optimizer
-    
+
     def build_scheduler(self, optimizer, n_iter_per_epoch, logger=None):
         num_steps = int(self.config.epochs * n_iter_per_epoch)
         warmup_steps = int(self.config.warmup_epochs * n_iter_per_epoch)
@@ -240,10 +255,10 @@ class EQENet(BaseModel):
             t_in_epochs=False,
         )
 
-        return lr_scheduler   
-    
+        return lr_scheduler
+
     @staticmethod
-    def train_one_epoch(epoch, model: nn.Module, criterion, optimizer, lr_scheduler, train_loader, config, logger, writter):
+    def train_one_epoch(epoch, model: nn.Module, criterion, optimizer, lr_scheduler, train_loader, config, logger, writer):
         model.train()
         optimizer.zero_grad()
 
@@ -263,12 +278,12 @@ class EQENet(BaseModel):
             mask = batch_data["mask"].cuda(non_blocking=True)
 
             batch = dict(imgs=images, time_slots=time_slots, mask=mask)
-            
+
             outputs = model(batch)
             logits = outputs["logits"]
-            total_loss = criterion(logits, label_id) + outputs["temporal_loss"]
+            total_loss = criterion(logits, label_id) + config.div_loss_weight * outputs["diversity_loss"]
             total_loss = total_loss / config.accumulation_steps
-            
+
             total_loss.backward()
 
             if config.accumulation_steps > 1:
@@ -298,18 +313,18 @@ class EQENet(BaseModel):
                     f"tot_loss {tot_loss_meter.val:.4f} ({tot_loss_meter.avg:.4f})\t"
                     f"mem {memory_used:.0f}MB"
                 )
-        
+
         epoch_time = time.time() - start
         logger.info(f"EPOCH {epoch} training takes {datetime.timedelta(seconds=int(epoch_time))}")
 
         dist.barrier()
         if dist.get_rank() == 0:
             tot_loss_meter.sync()
-            writter.add_scalar("Train loss", tot_loss_meter.avg, epoch)
+            writer.add_scalar("Train loss", tot_loss_meter.avg, epoch)
 
     @staticmethod
-    def validate(epoch, model, criterion, val_loader, config, logger, writter):
-        model.eval()     
+    def validate(epoch, model, criterion, val_loader, config, logger, writer):
+        model.eval()
 
         gather_meter = GatherMeter()
         acc_meter = AverageMeter()
@@ -325,11 +340,11 @@ class EQENet(BaseModel):
                 mask = batch_data["mask"].cuda(non_blocking=True)
 
                 batch = dict(imgs=images, time_slots=time_slots, mask=mask)
-                
+
                 outputs = model(batch)
                 logits = outputs["logits"]
 
-                loss = criterion(logits, label_id) + outputs["temporal_loss"]
+                loss = criterion(logits, label_id) + config.div_loss_weight * outputs["diversity_loss"]
                 probs = torch.softmax(logits, dim=-1)
                 _, inds = probs.topk(1, dim=-1)
 
@@ -348,17 +363,17 @@ class EQENet(BaseModel):
         gather_meter.sync()
         preds = gather_meter.preds
         labels = gather_meter.labels
-        cls_reportor = ClsReortor(preds, labels)
-        report = cls_reportor.get_dict_classification_report()
-        full_report = cls_reportor.get_str_classification_report()
+        reporter = ClassificationReporter(preds, labels)
+        report = reporter.get_dict_classification_report()
+        full_report = reporter.get_str_classification_report()
         logger.info(f"\n {full_report}")
 
         dist.barrier()
         if dist.get_rank() == 0:
-            writter.add_scalar("ValLoss", tot_loss_meter.avg, epoch)
-            writter.add_scalar("Accuracy", report["acc"], epoch)
-            writter.add_scalar("Precision", report["pre"], epoch)
-            writter.add_scalar("Recall", report["rec"], epoch)
-            writter.add_scalar("F1-score", report["f1"], epoch)
+            writer.add_scalar("ValLoss", tot_loss_meter.avg, epoch)
+            writer.add_scalar("Accuracy", report["acc"], epoch)
+            writer.add_scalar("Precision", report["pre"], epoch)
+            writer.add_scalar("Recall", report["rec"], epoch)
+            writer.add_scalar("F1-score", report["f1"], epoch)
 
         return report

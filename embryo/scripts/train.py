@@ -15,13 +15,13 @@ from torch.utils.tensorboard.writer import SummaryWriter
 # make the repository root importable no matter where the script is launched from
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from embryo.utils.logger import create_logger
-from embryo.models.EmbyroNet import EQENet
-from embryo.utils.tools import epoch_saving
+from embryo.models.costem import CoSTeM
+from embryo.utils.tools import save_checkpoint
 import warnings
 warnings.filterwarnings("ignore")
-     
 
-def parse_option():
+
+def parse_args():
     parser = argparse.ArgumentParser()
 
     # task arguments
@@ -50,6 +50,8 @@ def parse_option():
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--accumulation_steps", type=int, default=1)
     parser.add_argument("--label_smoothing", type=float, default=0.1)
+    parser.add_argument("--div_loss_weight", type=float, default=0.1,
+                        help="Weight lambda of the diversity loss on the temporal experts.")
     parser.add_argument("--print_freq", type=int, default=25)
     parser.add_argument("--save_freq", type=int, default=1)
     parser.add_argument("--input_size", type=int, default=224)
@@ -64,7 +66,7 @@ def parse_option():
     default_ckpt = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "pretrained_models", "clip_vit_base_patch16.ckpt")
     parser.add_argument("--pretrained_ckpt", type=str, default=default_ckpt,
-                        help="CLIP ViT-B/16 checkpoint used to initialize the frozen backbone. "
+                        help="CLIP ViT-B/16 checkpoint used to initialize the frozen image encoder. "
                              "If the file does not exist, the weights are downloaded from openai/clip-vit-base-patch16.")
 
     args = parser.parse_args()
@@ -76,7 +78,7 @@ def main(args):
     # set current device according to the local rank
     device = torch.device(f"cuda:{dist.get_rank()}")
 
-    model = EQENet(args)
+    model = CoSTeM(args)
     model = model.to(device)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[device], broadcast_buffers=False, find_unused_parameters=True)
 
@@ -129,13 +131,13 @@ def main(args):
     
     # training loop
     start_epoch, max_f1 = 0, 0.0
-    writter = SummaryWriter(log_dir=f"{working_dir}") if dist.get_rank() == 0 else None
+    writer = SummaryWriter(log_dir=f"{working_dir}") if dist.get_rank() == 0 else None
     for epoch in range(start_epoch, args.epochs):
         train_loader.sampler.set_epoch(epoch)
         model.module.train_one_epoch(epoch=epoch, model=model, criterion=criterion, optimizer=optimizer, lr_scheduler=scheduler,
-                               train_loader=train_loader, config=args, logger=logger, writter=writter)
+                               train_loader=train_loader, config=args, logger=logger, writer=writer)
         
-        report = model.module.validate(epoch=epoch, criterion=criterion, model=model, val_loader=val_loader, config=args, logger=logger, writter=writter)
+        report = model.module.validate(epoch=epoch, criterion=criterion, model=model, val_loader=val_loader, config=args, logger=logger, writer=writer)
         f1_score = report["f1"]
         logger.info(f"Macro F1-score of the {args.arch} on the {len(val_data)} test videos is {f1_score:.4f}.")
 
@@ -145,16 +147,16 @@ def main(args):
         
         # if on the main process and meets the save frequency, save model to the disk.
         if dist.get_rank() == 0 and (epoch % args.save_freq == 0 or epoch == args.epochs - 1):
-            epoch_saving(args, epoch, model, max_f1, optimizer, scheduler,
+            save_checkpoint(args, epoch, model, max_f1, optimizer, scheduler,
                         logger, working_dir=working_dir, is_best=is_best)
 
-    if writter is not None:
-        writter.close()
+    if writer is not None:
+        writer.close()
 
 
 
 if __name__ == "__main__":
-    args = parse_option()
+    args = parse_args()
 
     print(args)
 

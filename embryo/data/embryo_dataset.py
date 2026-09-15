@@ -13,7 +13,7 @@ from abc import ABCMeta, abstractmethod
 
 # make the repository root importable no matter where the module is imported from
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from embryo.data.pipeline_new_version import Compose
+from embryo.data.pipeline import Compose
 
 
 class BaseDataset(Dataset, metaclass=ABCMeta):
@@ -43,7 +43,7 @@ class BaseDataset(Dataset, metaclass=ABCMeta):
         """Load the annotation form json annotation files"""
 
 
-class MyEmbryoDataset(BaseDataset):
+class EmbryoDataset(BaseDataset):
     """Dataset class for embyro video data
     
     Arguments:
@@ -57,7 +57,7 @@ class MyEmbryoDataset(BaseDataset):
         self.pipeline = Compose(pipeline) if pipeline is not None else pipeline
         self.video_infos = self.load_annotations()
         # only videos that reach the blastocyst stage are used
-        self.video_infos = self.separate_day3_and_day5()
+        self.video_infos = self.filter_blastocyst_stage()
 
     def load_annotations(self):
         if self.ann_file.endswith(".json"):
@@ -133,7 +133,8 @@ class MyEmbryoDataset(BaseDataset):
 
         return video_infos   
     
-    def separate_day3_and_day5(self):
+    def filter_blastocyst_stage(self):
+        """Keep only the videos whose effective duration reaches the blastocyst stage."""
         new_info = []
         for info in self.video_infos:
             if info["effective_duration"][1] > 110.0:
@@ -193,7 +194,7 @@ if __name__ == "__main__":
     root_path = sys.argv[1] if len(sys.argv) > 1 else "embryo/data/embryo_videos"
     anno_file = sys.argv[2] if len(sys.argv) > 2 else "train.xlsx"
 
-    ds = MyEmbryoDataset(root_path=root_path, ann_file=anno_file, pipeline=None)
+    ds = EmbryoDataset(root_path=root_path, ann_file=anno_file, pipeline=None)
     ds.load_annotations()
     print(len(ds.video_infos))
     print(ds[0])

@@ -90,9 +90,14 @@ class MLP(nn.Module):
 
     
 
-class MultiframeIntegrationTransformer(nn.Module):
+class TemporalTransformer(nn.Module):
+    """Global temporal modelling of the class-token sequence (morphokinetic branch).
+
+    A ViViT-style transformer of ``layers`` cascaded blocks applied on the sequence of
+    per-frame class tokens.
+    """
     def __init__(self, length=32, embed_dim=512, layers=1, mlp_ratio=2, dropout=0.0, pe=True):
-        super(MultiframeIntegrationTransformer, self).__init__()
+        super(TemporalTransformer, self).__init__()
         transformer_heads = embed_dim // 64
         if pe:
             self.positional_embedding = nn.Parameter(torch.empty(1, length, embed_dim))
@@ -130,9 +135,11 @@ class MultiframeIntegrationTransformer(nn.Module):
     
 
 
-class TransformerDecoderLayer(nn.Module):
+class TemporalSelectionLayer(nn.Module):
+    """One layer of the Temporal Selection Block: cross-attention followed by a FFN."""
+
     def __init__(self, d_model, n_head, mlp_ratio=2, dropout=0.0):
-        super(TransformerDecoderLayer, self).__init__()
+        super(TemporalSelectionLayer, self).__init__()
 
         self.cross_attn = MHAttention(d_model=d_model, n_head=n_head, dropout=dropout)
 
@@ -161,28 +168,34 @@ class TransformerDecoderLayer(nn.Module):
 
 
 
-class AdaFeatSelection(nn.Module):
-    def __init__(self, n_layers=1, n_queries=8, seq_len=32, embed_dim=768, n_head=8, mlp_ratio=2, dropout=0.0, pe=False):
+class TemporalSelectionBlock(nn.Module):
+    """Temporal Selection Block (TSB).
+
+    ``n_experts`` learnable temporal experts act as queries and attend to the frame
+    sequence, so that the frames that matter most for the final grading are selected.
+    """
+
+    def __init__(self, n_layers=1, n_experts=8, seq_len=32, embed_dim=768, n_head=8, mlp_ratio=2, dropout=0.0, pe=False):
         super().__init__()
         self.pe = pe
-        self.queries = nn.Embedding(n_queries, embed_dim)
-        nn.init.normal_(self.queries.weight, std=0.02)
+        self.temporal_experts = nn.Embedding(n_experts, embed_dim)
+        nn.init.normal_(self.temporal_experts.weight, std=0.02)
         if pe:
             self.positional_embedding = nn.Parameter(torch.empty(1, seq_len, embed_dim))
             nn.init.normal_(self.positional_embedding, std=0.02)
 
-        self.layers = nn.ModuleList([TransformerDecoderLayer(d_model=embed_dim, n_head=n_head, mlp_ratio=mlp_ratio, dropout=dropout) for _ in range(n_layers)])
+        self.selection_layers = nn.ModuleList([TemporalSelectionLayer(d_model=embed_dim, n_head=n_head, mlp_ratio=mlp_ratio, dropout=dropout) for _ in range(n_layers)])
 
         self.post_ln = nn.LayerNorm(embed_dim)
 
     def _compute_diversity_loss(self):
         """Diversity regularization: penalize correlated queries / experts."""
-        norm_queries = F.normalize(self.queries.weight, p=2, dim=-1)  # [n_q, d]
+        norm_queries = F.normalize(self.temporal_experts.weight, p=2, dim=-1)  # [n_q, d]
         
         sim_matrix = torch.mm(norm_queries, norm_queries.T)  # [n_q, n_q]
         
         # exclude the diagonal, i.e. the similarity of a query with itself
-        mask = ~torch.eye(self.queries.weight.size(0), 
+        mask = ~torch.eye(self.temporal_experts.weight.size(0), 
                         dtype=torch.bool,
                         device=sim_matrix.device)
         
@@ -200,9 +213,9 @@ class AdaFeatSelection(nn.Module):
         if self.pe:
             tgt_feats = tgt_feats + (self.positional_embedding).repeat(B, 1, 1)
         
-        out = (self.queries.weight).unsqueeze(0).repeat(B, 1, 1)
+        out = (self.temporal_experts.weight).unsqueeze(0).repeat(B, 1, 1)
         attn_list = []
-        for layer in self.layers:
+        for layer in self.selection_layers:
             out, attn = layer(out, tgt_feats, tgt_feats, attn_mask)
             attn_list.append(attn)
 
@@ -234,7 +247,14 @@ class Adaptor(nn.Module):
         return x
 
 
-class MSFeatureModulation(nn.Module):
+class BypassAdaptationNetwork(nn.Module):
+    """Bypass Adaptation Network.
+
+    Modulates the intermediate features of the frozen image encoder (layers 3/6/9/12) with
+    one MLP adaptor + channel reduction per scale, which closes the domain gap between the
+    natural images CLIP was trained on and the embryo frames.
+    """
+
     def __init__(self, n_scale, embed_dim, hidden_dim, reduction=4):
         super().__init__()
         
@@ -266,43 +286,33 @@ class MSFeatureModulation(nn.Module):
         return ms_feat, ms_cls  # bt n c
     
 
-class FeatureSelectionModule(nn.Module):
+class MixtureOfCrossAttentiveExperts(nn.Module):
+    """Mixture of Cross-Attentive Experts (MCAE).
+
+    ``num_experts`` learnable spatial experts (one per developmental stage) attend to the
+    patch tokens of every frame; an MLP router predicts the belonging weight of each expert
+    and the frame feature is the weighted sum of the expert outputs.
+    """
+
     def __init__(self, seq_len, input_dim, num_experts, num_heads=8, dropout=0.3):
         super().__init__()
         self.seq_len = seq_len
         self.num_experts = num_experts
-        
-        # routing network: predicts the weight of every expert
-        self.linear = nn.Sequential(
+
+        # MLP router: predicts the weight of every expert
+        self.router = nn.Sequential(
                                     nn.Linear(input_dim, input_dim // 4, bias=False),
                                     nn.GELU(),
                                     nn.Linear(input_dim // 4, num_experts, bias=False)
                                     )
-        
-        # learnable expert tokens (1, 1, M, C)
-        self.experts = nn.Parameter(torch.randn(1, 1, num_experts, input_dim))
-        nn.init.normal_(self.experts, std=0.02)
-        
+
+        # learnable spatial expert tokens (1, 1, M, C)
+        self.spatial_experts = nn.Parameter(torch.randn(1, 1, num_experts, input_dim))
+        nn.init.normal_(self.spatial_experts, std=0.02)
+
         # cross attention between the expert tokens and the frame tokens
         self.cross_attn = MHAttention(d_model=input_dim, n_head=num_heads, dropout=dropout)
         self.ln = nn.LayerNorm(input_dim)
-
-
-    def _compute_diversity_loss(self):
-        """Diversity regularization: penalize correlated queries / experts."""
-        norm_queries = F.normalize(self.experts.squeeze(), p=2, dim=-1)  # [n_q, d]
-        
-        sim_matrix = torch.mm(norm_queries, norm_queries.T)  # [n_q, n_q]
-        
-        # exclude the diagonal, i.e. the similarity of a query with itself
-        mask = ~torch.eye(self.experts.size(2), 
-                        dtype=torch.bool,
-                        device=sim_matrix.device)
-        
-        # mean off-diagonal similarity
-        avg_sim = torch.abs(sim_matrix[mask]).mean()  # abs(): anti-correlated queries are penalized as well
-        
-        return avg_sim
 
     def forward(self, x):
         """x has shape (BT, N, C)."""
@@ -316,12 +326,12 @@ class FeatureSelectionModule(nn.Module):
         x_avg = torch.mean(x, dim=2)
 
         # 2. predict the routing weight of every expert -> (B, T, M)
-        weights = self.linear(self.ln(x_avg))
+        weights = self.router(self.ln(x_avg))
         weights = torch.softmax(weights, dim=-1)
         self.attn_weights = weights
 
         # 3. cross attention: expert queries (B*T, M, C) over the frame tokens (B*T, N, C)
-        q = self.experts.expand(B, T, -1, -1).reshape(B*T, self.num_experts, C)
+        q = self.spatial_experts.expand(B, T, -1, -1).reshape(B*T, self.num_experts, C)
         k = v = x.view(B*T, N, C)
 
         q, k, v = q.permute(1, 0, 2), k.permute(1, 0, 2), v.permute(1, 0, 2)

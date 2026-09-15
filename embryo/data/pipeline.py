@@ -982,7 +982,7 @@ class ToTensor:
 
 if __name__ == "__main__":
     # minimal smoke test of the sampling pipeline:
-    #   python -m embryo.data.pipeline_new_version /path/to/embryo_1.avi
+    #   python -m embryo.data.pipeline /path/to/embryo_1.avi
     filename = sys.argv[1] if len(sys.argv) > 1 else "embryo_1.avi"
 
     results = {

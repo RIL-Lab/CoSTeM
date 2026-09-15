@@ -425,7 +425,13 @@ class CLIPEncoder(nn.Module):
             last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
         )
 
-class EmbryoTransformer(nn.Module):
+class CLIPImageEncoder(nn.Module):
+    """CLIP ViT-B/16 vision tower, used as the frozen per-frame image encoder.
+
+    It is a re-implementation of ``transformers.CLIPVisionTransformer`` that returns the
+    hidden states of every layer, which the Bypass Adaptation Network needs.
+    """
+
     def __init__(self, config: CLIPVisionConfig):
         super().__init__()
         self.config = config
@@ -483,8 +489,12 @@ class EmbryoTransformer(nn.Module):
         )
 
 
-def build_backbone(config=None):
+def build_image_encoder(config=None):
+    """Build the CLIP ViT-B/16 image encoder from the official configuration.
 
+    Extra attributes of ``config`` (the training arguments) are copied into the CLIP
+    config when they are not already defined there.
+    """
     clip_config = CLIPVisionConfig.from_pretrained("openai/clip-vit-base-patch16")
 
     config = vars(config)
@@ -492,7 +502,7 @@ def build_backbone(config=None):
         if key not in clip_config.__dict__:
             clip_config.__dict__[key] = value
 
-    model = EmbryoTransformer(config=clip_config)
+    model = CLIPImageEncoder(config=clip_config)
 
     return model
 

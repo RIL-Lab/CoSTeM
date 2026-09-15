@@ -7,7 +7,7 @@ class BaseModel(nn.Module):
     """Base class of all embryo video models.
 
     A concrete model is expected to implement the methods below, which are called
-    by ``scripts/train_new_version.py``.
+    by ``scripts/train.py``.
     """
 
     def __init__(self, config) -> None:
@@ -29,10 +29,10 @@ class BaseModel(nn.Module):
     @staticmethod
     @abstractmethod
     def train_one_epoch(epoch, model, criterion, optimizer, lr_scheduler,
-                        train_loader, config, logger, writter):
+                        train_loader, config, logger, writer):
         raise NotImplementedError
 
     @staticmethod
     @abstractmethod
-    def validate(epoch, model, criterion, val_loader, config, logger, writter):
+    def validate(epoch, model, criterion, val_loader, config, logger, writer):
         raise NotImplementedError

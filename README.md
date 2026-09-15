@@ -1,8 +1,8 @@
-# EmbryoNet (CosSTeM)
+# Time-Lapse Video-Based Embryo Grading via Complementary Spatial-Temporal Pattern Mining （MICCAI 2025）
 
-Embryo quality grading from time-lapse microscopy (TLM) videos.
+Embryo quality grading from full-length time-lapse microscopy (TLM) videos.
 
-This repository contains the training code of **EQENet** (Embryo Quality Evaluation Network):
+This repository contains the training code of **CoSTem**:
 a frozen CLIP ViT-B/16 frame encoder followed by multi-scale feature modulation,
 spatial / temporal token selection and a Multiframe Integration Transformer.
 The entry point is [`embryo/scripts/train.sh`](embryo/scripts/train.sh), which launches a
